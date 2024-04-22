@@ -1,0 +1,6 @@
+{
+    "torProxy": "socks5://123.456.789.101:9050",
+    "targetURL": "http://td5x3fcf5uqu5asdfasdf2uxfqo4hxxda2pmllpid.onion/",
+    "threads": 1,
+    "fileSize": 1
+  }
