@@ -7,7 +7,9 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 )
 
 type Metadata struct {
@@ -17,7 +19,11 @@ type Metadata struct {
 }
 
 var metadataCache []Metadata
+var torBridge = "socks5://138.68.150.252:9050"
 
+func defaultHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "default")
+}
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("filename")
 	file, err := os.Open(fileName)
@@ -58,7 +64,18 @@ func metadataHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, errorFromDecode.Error(), http.StatusInternalServerError)
 	}
 }
+func readFileContent(filePath string) (string, error) {
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return "", fmt.Errorf("file does not exist: %s", filePath)
+	}
 
+	content, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("error reading file: %s", err)
+	}
+
+	return strings.TrimSuffix(string(content), "\n"), nil
+}
 func getOrCreateMetadateFor(fileName string) (*Metadata, error) {
 	for _, file := range metadataCache {
 		if file.FileName == fileName {
@@ -68,17 +85,26 @@ func getOrCreateMetadateFor(fileName string) (*Metadata, error) {
 	fileContent, _ := os.Open(fileName)
 	defer fileContent.Close()
 	stats, _ := fileContent.Stat()
+	onionHostNameFile := "/var/lib/tor/hidden_service/hostname"
+	onionHostName, err := readFileContent(onionHostNameFile)
+	if err != nil {
+		return nil, err
+	}
 	newMetadata := Metadata{
 		FileName: fileName,
 		FileSize: stats.Size(),
-		Peers:    []string{"http://localhost:8080"},
+		Peers:    []string{"http://" + onionHostName},
 	}
 	metadataCache = append(metadataCache, newMetadata)
 	return &newMetadata, nil
 }
 
 func downloadFile(metadata *Metadata) {
-	client := &http.Client{}
+	torBridgeURL, err := url.Parse(torBridge)
+	if err != nil {
+		return
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(torBridgeURL)}}
 	urlWithParam := fmt.Sprintf("%s?filename=%s", metadata.Peers[0]+"/download", metadata.FileName)
 	downloadRequest, err := http.NewRequest(http.MethodGet, urlWithParam, nil)
 	if err != nil {
@@ -102,7 +128,11 @@ func downloadFile(metadata *Metadata) {
 	fmt.Println(string(responseBody))
 }
 func downloadMetadata(baseUrl string) (*Metadata, error) {
-	client := &http.Client{}
+	torBridgeURL, err := url.Parse(torBridge)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(torBridgeURL)}}
 	urlWithParam := fmt.Sprintf("%s?filename=%s", baseUrl+"/metadata", "test.txt")
 	metadataRequest, err := http.NewRequest(http.MethodGet, urlWithParam, nil)
 	if err != nil {
@@ -162,9 +192,9 @@ func cacheMetadata(metadata *Metadata) {
 func main() {
 	port := ":8080"
 
+	http.HandleFunc("/", defaultHandler)
 	http.HandleFunc("/download", downloadHandler)
 	http.HandleFunc("/metadata", metadataHandler)
-
 	go func() {
 		fmt.Printf("Server listening on port %s\n", port)
 		fmt.Println("Waiting for requests...")
