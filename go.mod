@@ -1,3 +1,3 @@
-module tor-ut_pex
+module increasing-throughput-in-tor 
 
 go 1.22

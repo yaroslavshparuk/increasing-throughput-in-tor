@@ -16,7 +16,7 @@ type Metadata struct {
 	Peers    []string `json:"peers"`
 }
 
-var fileWithKnownPeers []Metadata
+var metadataCache []Metadata
 
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("filename")
@@ -60,7 +60,7 @@ func metadataHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getOrCreateMetadateFor(fileName string) (*Metadata, error) {
-	for _, file := range fileWithKnownPeers {
+	for _, file := range metadataCache {
 		if file.FileName == fileName {
 			return &file, nil
 		}
@@ -73,7 +73,7 @@ func getOrCreateMetadateFor(fileName string) (*Metadata, error) {
 		FileSize: stats.Size(),
 		Peers:    []string{"http://localhost:8080"},
 	}
-	fileWithKnownPeers = append(fileWithKnownPeers, newMetadata)
+	metadataCache = append(metadataCache, newMetadata)
 	return &newMetadata, nil
 }
 
@@ -133,7 +133,32 @@ func downloadMetadata(baseUrl string) (*Metadata, error) {
 	fmt.Printf("Status code: %d\nSize: %d\n", metadataResponse.StatusCode, metadata.FileSize)
 	return &metadata, nil
 }
+func mergeUniqueSlices(slice1, slice2 []string) []string {
+	valueSet := make(map[string]struct{})
 
+	for _, value := range slice1 {
+		valueSet[value] = struct{}{}
+	}
+	for _, value := range slice2 {
+		valueSet[value] = struct{}{}
+	}
+
+	uniqueSlice := make([]string, 0, len(valueSet))
+	for key := range valueSet {
+		uniqueSlice = append(uniqueSlice, key)
+	}
+	return uniqueSlice
+}
+func cacheMetadata(metadata *Metadata) {
+	for i, file := range metadataCache {
+		if file.FileName == metadata.FileName {
+			metadataCache[i].Peers = mergeUniqueSlices(file.Peers, metadata.Peers)
+			return
+		}
+	}
+
+	metadataCache = append(metadataCache, *metadata)
+}
 func main() {
 	port := ":8080"
 
@@ -166,7 +191,7 @@ func main() {
 				fmt.Println("Error downloading file metadata:", err)
 			}
 			downloadFile(fileMetadata)
-
+			cacheMetadata(fileMetadata)
 		case "exit":
 			fmt.Println("Exiting...")
 			os.Exit(0)
