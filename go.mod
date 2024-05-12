@@ -1,3 +1,3 @@
 module increasing-throughput-in-tor 
 
-go 1.22
+go 1.22.1

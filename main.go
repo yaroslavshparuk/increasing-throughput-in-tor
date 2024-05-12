@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 type Metadata struct {
@@ -19,28 +21,42 @@ type Metadata struct {
 }
 
 var metadataCache []Metadata
-var torBridge = "socks5://138.68.150.252:9050"
+var torBridge = "socks5://127.0.0.1:9050"
 
 func defaultHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "default")
 }
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("filename")
+	start, err := strconv.ParseInt(r.URL.Query().Get("start"), 10, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	end, err := strconv.ParseInt(r.URL.Query().Get("end"), 10, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	file, err := os.Open(fileName)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	fileStat, err := file.Stat()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if start < 0 || end > fileStat.Size()-1 || start > end {
+		http.Error(w, "Invalid range", http.StatusBadRequest)
+		return
+	}
 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileStat.Size()))
-
-	_, err = io.Copy(w, file)
+	// 	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileStat.Size()))
+	sectionReader := io.NewSectionReader(file, start, end-start+1)
+	_, err = io.Copy(w, sectionReader)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -99,13 +115,13 @@ func getOrCreateMetadateFor(fileName string) (*Metadata, error) {
 	return &newMetadata, nil
 }
 
-func downloadFile(metadata *Metadata) {
+func downloadFile(baseUrl string, filename string, start int64, end int64, partNumber int) {
 	torBridgeURL, err := url.Parse(torBridge)
 	if err != nil {
 		return
 	}
 	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(torBridgeURL)}}
-	urlWithParam := fmt.Sprintf("%s?filename=%s", metadata.Peers[0]+"/download", metadata.FileName)
+	urlWithParam := fmt.Sprintf("%s?filename=%s?start=%d?end=%d", baseUrl+"/download", filename, start, end)
 	downloadRequest, err := http.NewRequest(http.MethodGet, urlWithParam, nil)
 	if err != nil {
 		fmt.Println("Error creating request:", err)
@@ -125,7 +141,18 @@ func downloadFile(metadata *Metadata) {
 		fmt.Println("Error reading response body:", err)
 		return
 	}
-	fmt.Println(string(responseBody))
+
+	out, err := os.Create(fmt.Sprintf("part%d", partNumber))
+	if err != nil {
+		fmt.Println("Error creating file:", err)
+		return
+	}
+	defer out.Close()
+	_, err = out.Write(responseBody)
+	if err != nil {
+		fmt.Println("Error writing response:", err)
+		return
+	}
 }
 func downloadMetadata(baseUrl string) (*Metadata, error) {
 	torBridgeURL, err := url.Parse(torBridge)
@@ -133,7 +160,7 @@ func downloadMetadata(baseUrl string) (*Metadata, error) {
 		return nil, err
 	}
 	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(torBridgeURL)}}
-	urlWithParam := fmt.Sprintf("%s?filename=%s", baseUrl+"/metadata", "test.txt")
+	urlWithParam := fmt.Sprintf("%s?filename=%s", baseUrl+"/metadata", "12Mb.txt")
 	metadataRequest, err := http.NewRequest(http.MethodGet, urlWithParam, nil)
 	if err != nil {
 		fmt.Println("Error creating request:", err)
@@ -189,9 +216,32 @@ func cacheMetadata(metadata *Metadata) {
 
 	metadataCache = append(metadataCache, *metadata)
 }
+
+func combineFiles(numParts int, outFile string) error {
+	out, err := os.Create(outFile)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	for i := 1; i <= numParts; i++ {
+		filename := fmt.Sprintf("part%d.txt", i)
+		f, err := os.Open(filename)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(out, f)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	port := ":8080"
-
 	http.HandleFunc("/", defaultHandler)
 	http.HandleFunc("/download", downloadHandler)
 	http.HandleFunc("/metadata", metadataHandler)
@@ -219,8 +269,33 @@ func main() {
 			fileMetadata, err := downloadMetadata(scanner.Text())
 			if err != nil {
 				fmt.Println("Error downloading file metadata:", err)
+				break
 			}
-			downloadFile(fileMetadata)
+			var waitGroup sync.WaitGroup
+			peersCount := len(fileMetadata.Peers)
+			partSize := fileMetadata.FileSize / int64(peersCount)
+			for i := 0; i < peersCount; i++ {
+				waitGroup.Add(1)
+				start := int64(i) * partSize
+				end := start + partSize - 1
+				go func(peerUrl string, fileName string, start int64, end int64, i int) {
+					defer waitGroup.Done()
+					downloadFile(peerUrl, fileName, start, end, i)
+				}(fileMetadata.Peers[i], fileMetadata.FileName, start, end, i)
+			}
+			waitGroup.Wait()
+			for i := 1; i <= peersCount; i++ {
+				filename := fmt.Sprintf("part%d.txt", i)
+				err = os.Remove(filename)
+				if err != nil {
+					fmt.Printf("Error removing %s: %v\n", filename, err)
+				}
+			}
+			err = combineFiles(peersCount, "full.txt")
+			if err != nil {
+				fmt.Println("Error combining files:", err)
+				break
+			}
 			cacheMetadata(fileMetadata)
 		case "exit":
 			fmt.Println("Exiting...")
