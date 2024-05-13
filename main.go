@@ -21,6 +21,7 @@ type Metadata struct {
 }
 
 var metadataCache []Metadata
+
 var torBridge = "socks5://127.0.0.1:9050"
 
 func defaultHandler(w http.ResponseWriter, r *http.Request) {
@@ -67,17 +68,20 @@ func metadataHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := queryString.Get("filename")
 	if fileName == "" {
 		http.Error(w, "filename is required", http.StatusBadRequest)
+		return
 	}
 
 	fileMetadata, errorFromGet := getOrCreateMetadateFor(fileName)
 	if errorFromGet != nil {
 		http.Error(w, errorFromGet.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	errorFromDecode := json.NewEncoder(w).Encode(fileMetadata)
 	if errorFromDecode != nil {
 		http.Error(w, errorFromDecode.Error(), http.StatusInternalServerError)
+		return
 	}
 }
 func readFileContent(filePath string) (string, error) {
@@ -101,9 +105,9 @@ func getOrCreateMetadateFor(fileName string) (*Metadata, error) {
 	fileContent, _ := os.Open(fileName)
 	defer fileContent.Close()
 	stats, _ := fileContent.Stat()
-	onionHostNameFile := "/var/lib/tor/hidden_service/hostname"
-	onionHostName, err := readFileContent(onionHostNameFile)
+	onionHostName, err := getHostOnionName()
 	if err != nil {
+		fmt.Println(err)
 		return nil, err
 	}
 	newMetadata := Metadata{
@@ -115,13 +119,22 @@ func getOrCreateMetadateFor(fileName string) (*Metadata, error) {
 	return &newMetadata, nil
 }
 
+func getHostOnionName() (string, error) {
+	onionHostNameFile := "/var/lib/tor/hidden_service/hostname"
+	onionHostName, err := readFileContent(onionHostNameFile)
+	if err != nil || onionHostName == "" {
+		return "", err
+	}
+	return onionHostName, nil
+}
+
 func downloadFile(baseUrl string, filename string, start int64, end int64, partNumber int) {
 	torBridgeURL, err := url.Parse(torBridge)
 	if err != nil {
 		return
 	}
 	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(torBridgeURL)}}
-	urlWithParam := fmt.Sprintf("%s?filename=%s?start=%d?end=%d", baseUrl+"/download", filename, start, end)
+	urlWithParam := fmt.Sprintf("%s?filename=%s&start=%d&end=%d", baseUrl+"/download", filename, start, end)
 	downloadRequest, err := http.NewRequest(http.MethodGet, urlWithParam, nil)
 	if err != nil {
 		fmt.Println("Error creating request:", err)
@@ -142,7 +155,7 @@ func downloadFile(baseUrl string, filename string, start int64, end int64, partN
 		return
 	}
 
-	out, err := os.Create(fmt.Sprintf("part%d", partNumber))
+	out, err := os.Create(fmt.Sprintf("part%d.txt", partNumber))
 	if err != nil {
 		fmt.Println("Error creating file:", err)
 		return
@@ -172,7 +185,9 @@ func downloadMetadata(baseUrl string) (*Metadata, error) {
 		fmt.Println("Error sending request:", err)
 		return nil, err
 	}
-
+	if metadataResponse.StatusCode != http.StatusOK {
+		fmt.Println("Error sending request:", metadataResponse.StatusCode)
+	}
 	defer metadataResponse.Body.Close()
 	responseBody, err := ioutil.ReadAll(metadataResponse.Body)
 
@@ -224,7 +239,7 @@ func combineFiles(numParts int, outFile string) error {
 	}
 	defer out.Close()
 
-	for i := 1; i <= numParts; i++ {
+	for i := 0; i < numParts; i++ {
 		filename := fmt.Sprintf("part%d.txt", i)
 		f, err := os.Open(filename)
 		if err != nil {
@@ -241,7 +256,7 @@ func combineFiles(numParts int, outFile string) error {
 }
 
 func main() {
-	port := ":8080"
+	port := ":80"
 	http.HandleFunc("/", defaultHandler)
 	http.HandleFunc("/download", downloadHandler)
 	http.HandleFunc("/metadata", metadataHandler)
@@ -271,31 +286,38 @@ func main() {
 				fmt.Println("Error downloading file metadata:", err)
 				break
 			}
-			var waitGroup sync.WaitGroup
+			var wg sync.WaitGroup = sync.WaitGroup{}
 			peersCount := len(fileMetadata.Peers)
+
 			partSize := fileMetadata.FileSize / int64(peersCount)
 			for i := 0; i < peersCount; i++ {
-				waitGroup.Add(1)
+				wg.Add(1)
 				start := int64(i) * partSize
 				end := start + partSize - 1
-				go func(peerUrl string, fileName string, start int64, end int64, i int) {
-					defer waitGroup.Done()
-					downloadFile(peerUrl, fileName, start, end, i)
-				}(fileMetadata.Peers[i], fileMetadata.FileName, start, end, i)
+				go func() {
+					defer wg.Done()
+					downloadFile(fileMetadata.Peers[0], fileMetadata.FileName, start, end, i)
+				}()
 			}
-			waitGroup.Wait()
-			for i := 1; i <= peersCount; i++ {
+			wg.Wait()
+
+			err = combineFiles(peersCount, "full.txt")
+			if err != nil {
+				fmt.Println("Error combining files:", err)
+				break
+			}
+			for i := 0; i < peersCount; i++ {
 				filename := fmt.Sprintf("part%d.txt", i)
 				err = os.Remove(filename)
 				if err != nil {
 					fmt.Printf("Error removing %s: %v\n", filename, err)
 				}
 			}
-			err = combineFiles(peersCount, "full.txt")
+			onionHostName, err := getHostOnionName()
 			if err != nil {
-				fmt.Println("Error combining files:", err)
-				break
+				fmt.Println("Error in getting onion host name:", err)
 			}
+			fileMetadata.Peers = append(fileMetadata.Peers, "http://"+onionHostName)
 			cacheMetadata(fileMetadata)
 		case "exit":
 			fmt.Println("Exiting...")
